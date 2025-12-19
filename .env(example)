@@ -1,0 +1,6 @@
+MYSQL_DATABASE=railway
+MYSQL_PUBLIC_URL=mysql://ddTK
+MYSQL_URL=mysql://root:kAdFSidTK@mysql.railway.internal:3306/railway
+MYSQLDATABASE=raddddyf
+MYSQLPASSWORD=kAPBYkriGOMBmtwuNXijMjpwMeFSidTK
+MYSQLPORT=3306
