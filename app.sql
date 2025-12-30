@@ -1,4 +1,4 @@
--- anujsmit/mensuration_tracker_backend/mensuration_tracker_backend-b270fad9aad702aa4e349ee6e2e2cfd2756512dc/app.sql (FIXED AND CLEANED)
+-- app.sql (FIXED AND CLEANED)
 DROP DATABASE IF EXISTS menstrual_health_app;
 CREATE DATABASE menstrual_health_app;
 USE menstrual_health_app;
@@ -22,8 +22,7 @@ CREATE TABLE users (
   last_login TIMESTAMP NULL,
   firebase_uid VARCHAR(255) UNIQUE,
   photo_url VARCHAR(500),
-  UNIQUE KEY unique_identity_email (email),
-  UNIQUE KEY unique_identity_phone (phone_number)
+  UNIQUE KEY unique_identity (email, phone_number)
 );
 
 -- Profile Table
@@ -138,7 +137,17 @@ CREATE TABLE symptoms (
   INDEX idx_user_symptoms (user_id, symptom_date)
 );
 
--- REMOVED: phone_verifications table, cleanup_expired_otps stored procedure and event.
+-- Phone OTP Table (New)
+CREATE TABLE phone_verifications (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  phone_number VARCHAR(20) NOT NULL,
+  otp VARCHAR(6) NOT NULL,
+  expires_at DATETIME NOT NULL,
+  used BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_phone_otp (phone_number, otp),
+  INDEX idx_expires (expires_at)
+);
 
 -- Insert default notification types
 INSERT INTO notification_types (name, description, is_system_generated, icon_name, color_code) VALUES
@@ -207,19 +216,130 @@ AFTER INSERT ON users
 FOR EACH ROW
 BEGIN
   INSERT INTO user_notification_preferences (user_id) VALUES (NEW.id);
-  
-  -- Create initial profile entry
-  INSERT INTO profile (user_id) VALUES (NEW.id);
-
-  -- Send welcome notification (System Alert - type_id 1)
-  INSERT INTO notifications 
-  (type_id, title, message) 
-  VALUES (1, 'Welcome to Menstrual Tracker!', 'Start tracking your menstrual health journey.');
-
-  SET @notificationId = LAST_INSERT_ID();
-
-  INSERT INTO user_notifications (user_id, notification_id) 
-  VALUES (NEW.id, @notificationId);
 END //
 
+CREATE PROCEDURE cleanup_expired_otps()
+BEGIN
+  DELETE FROM phone_verifications 
+  WHERE expires_at < NOW() 
+     OR (created_at < DATE_SUB(NOW(), INTERVAL 24 HOUR) AND used = FALSE);
+END //
+DELIMITER ;
+
+-- Schedule OTP cleanup
+CREATE EVENT IF NOT EXISTS cleanup_expired_otps_event
+ON SCHEDULE EVERY 1 HOUR
+DO
+  CALL cleanup_expired_otps();
+  
+select * from users;
+-- Update the daily_notes table to include period tracking
+ALTER TABLE daily_notes
+ADD COLUMN is_period_day BOOLEAN DEFAULT FALSE,
+ADD COLUMN pads_used INT DEFAULT 0,
+ADD COLUMN period_intensity ENUM('light', 'medium', 'heavy') DEFAULT 'medium',
+ADD COLUMN period_notes TEXT,
+ADD INDEX idx_period_days (user_id, note_date, is_period_day);
+
+-- Add period summary table for easier reporting
+CREATE TABLE period_summary (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL,
+  cycle_id INT,
+  start_date DATE NOT NULL,
+  end_date DATE,
+  total_pads_used INT DEFAULT 0,
+  average_intensity ENUM('light', 'medium', 'heavy'),
+  notes TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (cycle_id) REFERENCES menstrual_cycles(id) ON DELETE SET NULL,
+  UNIQUE KEY unique_user_period (user_id, start_date),
+  INDEX idx_user_periods (user_id, start_date)
+);
+
+-- Create trigger to update period summary when daily notes are updated
+DELIMITER //
+CREATE TRIGGER after_daily_note_update_period
+AFTER UPDATE ON daily_notes
+FOR EACH ROW
+BEGIN
+    -- If period status changed or pads used changed
+    IF (OLD.is_period_day != NEW.is_period_day) OR (OLD.pads_used != NEW.pads_used) THEN
+        CALL update_period_summary(NEW.user_id, NEW.note_date);
+    END IF;
+END //
+
+CREATE TRIGGER after_daily_note_insert_period
+AFTER INSERT ON daily_notes
+FOR EACH ROW
+BEGIN
+    IF NEW.is_period_day = TRUE THEN
+        CALL update_period_summary(NEW.user_id, NEW.note_date);
+    END IF;
+END //
+
+CREATE PROCEDURE update_period_summary(
+    IN p_user_id INT,
+    IN p_note_date DATE
+)
+BEGIN
+    DECLARE period_start DATE;
+    DECLARE period_end DATE;
+    DECLARE v_cycle_id INT;
+    DECLARE total_pads INT;
+    DECLARE avg_intensity VARCHAR(10);
+    
+    -- Find the continuous period days for this user
+    SELECT MIN(note_date), MAX(note_date)
+    INTO period_start, period_end
+    FROM daily_notes
+    WHERE user_id = p_user_id 
+      AND is_period_day = TRUE
+      AND note_date BETWEEN DATE_SUB(p_note_date, INTERVAL 10 DAY) 
+                        AND DATE_ADD(p_note_date, INTERVAL 10 DAY);
+    
+    -- Calculate total pads used in this period
+    SELECT COALESCE(SUM(pads_used), 0)
+    INTO total_pads
+    FROM daily_notes
+    WHERE user_id = p_user_id 
+      AND is_period_day = TRUE
+      AND note_date BETWEEN period_start AND period_end;
+    
+    -- Find the most common intensity
+    SELECT period_intensity INTO avg_intensity
+    FROM (
+        SELECT period_intensity, COUNT(*) as count
+        FROM daily_notes
+        WHERE user_id = p_user_id 
+          AND is_period_day = TRUE
+          AND note_date BETWEEN period_start AND period_end
+          AND period_intensity IS NOT NULL
+        GROUP BY period_intensity
+        ORDER BY count DESC
+        LIMIT 1
+    ) intensity_counts;
+    
+    -- Find the menstrual cycle that this period belongs to
+    SELECT id INTO v_cycle_id
+    FROM menstrual_cycles
+    WHERE user_id = p_user_id 
+      AND start_date <= period_start 
+      AND (end_date IS NULL OR end_date >= period_end)
+    ORDER BY start_date DESC
+    LIMIT 1;
+    
+    -- Insert or update period summary
+    INSERT INTO period_summary 
+      (user_id, cycle_id, start_date, end_date, total_pads_used, average_intensity, notes)
+    VALUES 
+      (p_user_id, v_cycle_id, period_start, period_end, total_pads, avg_intensity, '')
+    ON DUPLICATE KEY UPDATE
+      end_date = VALUES(end_date),
+      total_pads_used = VALUES(total_pads_used),
+      average_intensity = VALUES(average_intensity),
+      updated_at = CURRENT_TIMESTAMP;
+END //
 DELIMITER ;
